@@ -50,7 +50,7 @@ const App = () => {
       // Create SpeexWorkletNode
       speexNodeRef.current = new SpeexWorkletNode(audioContextRef.current, {
         wasmBinary: speexWasmBinary,
-        maxChannels: 2, // Mono audio
+        maxChannels: 1, // Mono audio
       });
 
       // Connect nodes: source -> speexNode (NO playback)
