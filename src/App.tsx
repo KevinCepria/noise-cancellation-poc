@@ -1,28 +1,36 @@
 import { useState, useRef } from "react";
 import { AudioVisualizer } from "react-audio-visualize";
-import { loadSpeex, SpeexWorkletNode } from "@sapphi-red/web-noise-suppressor";
+import {
+  loadSpeex,
+  SpeexWorkletNode,
+  RnnoiseWorkletNode,
+} from "@sapphi-red/web-noise-suppressor";
 import speexWorkletPath from "@sapphi-red/web-noise-suppressor/speexWorklet.js?url";
 import speexWasmPath from "@sapphi-red/web-noise-suppressor/speex.wasm?url";
+import rnnoiseWorkletPath from "@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url";
+import rnnoiseWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise.wasm?url";
 
 const App = () => {
   const [isRecording, setIsRecording] = useState(false);
-  const [processedAudioBlob, setProcessedAudioBlob] = useState<Blob | null>(
-    null
-  );
+  const [speexAudioBlob, setSpeexAudioBlob] = useState<Blob | null>(null);
+  const [rnnoiseAudioBlob, setRnnoiseAudioBlob] = useState<Blob | null>(null);
   const [rawAudioBlob, setRawAudioBlob] = useState<Blob | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const rnnoiseRecorderRef = useRef<MediaRecorder | null>(null);
   const rawRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
+  const speexChunksRef = useRef<Blob[]>([]);
+  const rnnoiseChunksRef = useRef<Blob[]>([]);
   const rawChunksRef = useRef<Blob[]>([]);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const speexNodeRef = useRef<SpeexWorkletNode | null>(null);
+  const rnnoiseNodeRef = useRef<RnnoiseWorkletNode | null>(null);
 
   const startRecording = async () => {
     try {
-      //Get Meida steam
+      // Get media stream
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -36,56 +44,77 @@ const App = () => {
         rawChunksRef.current.push(event.data);
       };
 
-      // Setup AudioContext for processing
+      // Setup AudioContext
       audioContextRef.current = new AudioContext();
       sourceNodeRef.current =
         audioContextRef.current.createMediaStreamSource(stream);
 
-      // Load Speex WASM binary
+      // Load Speex WASM binary and processor
       const speexWasmBinary = await loadSpeex({ url: speexWasmPath });
-
-      // Load the Speex audio worklet processor
       await audioContextRef.current.audioWorklet.addModule(speexWorkletPath);
-
-      // Create SpeexWorkletNode
       speexNodeRef.current = new SpeexWorkletNode(audioContextRef.current, {
         wasmBinary: speexWasmBinary,
-        maxChannels: 1, // Mono audio
+        maxChannels: 1,
       });
-
-      // Connect nodes: source -> speexNode (NO playback)
       sourceNodeRef.current.connect(speexNodeRef.current);
 
-      // Create a new MediaStream for processed audio
-      const processedStream =
+      // Create stream for Speex processed audio
+      const speexProcessedStream =
         audioContextRef.current.createMediaStreamDestination();
-      speexNodeRef.current.connect(processedStream);
+      speexNodeRef.current.connect(speexProcessedStream);
 
-      // Capture processed (noise-canceled) audio
-      mediaRecorderRef.current = new MediaRecorder(processedStream.stream);
+      // Capture Speex processed audio
+      mediaRecorderRef.current = new MediaRecorder(speexProcessedStream.stream);
       mediaRecorderRef.current.ondataavailable = (event) => {
-        audioChunksRef.current.push(event.data);
+        speexChunksRef.current.push(event.data);
       };
 
-      // Handle processed audio Blob on recording stop
+      // Load RNNoise WASM binary and processor
+      const rnnoiseWasmBinary = await loadSpeex({ url: rnnoiseWasmPath });
+      await audioContextRef.current.audioWorklet.addModule(rnnoiseWorkletPath);
+      rnnoiseNodeRef.current = new RnnoiseWorkletNode(audioContextRef.current, {
+        wasmBinary: rnnoiseWasmBinary,
+        maxChannels: 1,
+      });
+      sourceNodeRef.current.connect(rnnoiseNodeRef.current);
+
+      // Create stream for RNNoise processed audio
+      const rnnoiseProcessedStream =
+        audioContextRef.current.createMediaStreamDestination();
+      rnnoiseNodeRef.current.connect(rnnoiseProcessedStream);
+
+      // Capture RNNoise processed audio
+      rnnoiseRecorderRef.current = new MediaRecorder(
+        rnnoiseProcessedStream.stream
+      );
+      rnnoiseRecorderRef.current.ondataavailable = (event) => {
+        rnnoiseChunksRef.current.push(event.data);
+      };
+
+      // Handle processed audio Blobs on recording stop
       mediaRecorderRef.current.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, {
-          type: "audio/wav",
-        });
-        setProcessedAudioBlob(audioBlob);
-        audioChunksRef.current = [];
+        setSpeexAudioBlob(
+          new Blob(speexChunksRef.current, { type: "audio/wav" })
+        );
+        speexChunksRef.current = [];
       };
 
-      // Handle raw audio Blob on recording stop
+      rnnoiseRecorderRef.current.onstop = () => {
+        setRnnoiseAudioBlob(
+          new Blob(rnnoiseChunksRef.current, { type: "audio/wav" })
+        );
+        rnnoiseChunksRef.current = [];
+      };
+
       rawRecorderRef.current.onstop = () => {
-        const rawBlob = new Blob(rawChunksRef.current, { type: "audio/wav" });
-        setRawAudioBlob(rawBlob);
+        setRawAudioBlob(new Blob(rawChunksRef.current, { type: "audio/wav" }));
         rawChunksRef.current = [];
       };
 
-      // Start recording both raw and processed audio
+      // Start recording
       rawRecorderRef.current.start();
       mediaRecorderRef.current.start();
+      rnnoiseRecorderRef.current.start();
       setIsRecording(true);
     } catch (error) {
       console.error("Error accessing microphone:", error);
@@ -98,6 +127,12 @@ const App = () => {
       mediaRecorderRef.current.state !== "inactive"
     ) {
       mediaRecorderRef.current.stop();
+    }
+    if (
+      rnnoiseRecorderRef.current &&
+      rnnoiseRecorderRef.current.state !== "inactive"
+    ) {
+      rnnoiseRecorderRef.current.stop();
     }
     if (rawRecorderRef.current && rawRecorderRef.current.state !== "inactive") {
       rawRecorderRef.current.stop();
@@ -113,15 +148,14 @@ const App = () => {
       speexNodeRef.current.disconnect();
       speexNodeRef.current = null;
     }
+    if (rnnoiseNodeRef.current) {
+      rnnoiseNodeRef.current.disconnect();
+      rnnoiseNodeRef.current = null;
+    }
     if (sourceNodeRef.current) {
       sourceNodeRef.current.disconnect();
       sourceNodeRef.current = null;
     }
-
-    // Stop microphone stream
-    navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
-      stream.getTracks().forEach((track) => track.stop());
-    });
   };
 
   return (
@@ -145,12 +179,27 @@ const App = () => {
         </div>
       )}
 
-      {processedAudioBlob && (
+      {speexAudioBlob && (
         <div>
-          <h2>Noise-Canceled Audio</h2>
-          <audio src={URL.createObjectURL(processedAudioBlob)} controls />
+          <h2>(Speex)Noise-Canceled Audio</h2>
+          <audio src={URL.createObjectURL(speexAudioBlob)} controls />
           <AudioVisualizer
-            blob={processedAudioBlob}
+            blob={speexAudioBlob}
+            width={500}
+            height={75}
+            barWidth={1}
+            gap={0}
+            barColor={"#f76565"}
+          />
+        </div>
+      )}
+
+      {rnnoiseAudioBlob && (
+        <div>
+          <h2>(Rnnoise) Noise-Canceled Audio</h2>
+          <audio src={URL.createObjectURL(rnnoiseAudioBlob)} controls />
+          <AudioVisualizer
+            blob={rnnoiseAudioBlob}
             width={500}
             height={75}
             barWidth={1}
