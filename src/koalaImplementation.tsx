@@ -1,8 +1,7 @@
-// src/KoalaNoiseSuppression.tsx
 import React, { useState, useRef } from "react";
 import { WebVoiceProcessor } from "@picovoice/web-voice-processor";
 import { KoalaWorker } from "@picovoice/koala-web";
-import koalaModel from "./uitls/koala_params"; // Ensure this exports a constant `koalaModel`
+import koalaModel from "./uitls/koala_params";
 import { AudioVisualizer } from "react-audio-visualize";
 
 import { int16ToWavBuffer } from "./uitls/audio";

@@ -9,27 +9,69 @@ import speexWorkletPath from "@sapphi-red/web-noise-suppressor/speexWorklet.js?u
 import speexWasmPath from "@sapphi-red/web-noise-suppressor/speex.wasm?url";
 import rnnoiseWorkletPath from "@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url";
 import rnnoiseWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise.wasm?url";
+import { KoalaWorker } from "@picovoice/koala-web";
+import { WebVoiceProcessor } from "@picovoice/web-voice-processor";
+
+import koalaModel from "./uitls/koala_params";
+import { int16ToWavBuffer } from "./uitls/audio";
 
 const App = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [speexAudioBlob, setSpeexAudioBlob] = useState<Blob | null>(null);
   const [rnnoiseAudioBlob, setRnnoiseAudioBlob] = useState<Blob | null>(null);
   const [rawAudioBlob, setRawAudioBlob] = useState<Blob | null>(null);
+  const [koalaInitialized, setKoalaInitialized] = useState(false);
+  const [koalaAudioBlob, setKoalaAudioBlob] = useState<Blob | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [accessKey, setAccessKey] = useState("");
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const speexRecorderRef = useRef<MediaRecorder | null>(null);
   const rnnoiseRecorderRef = useRef<MediaRecorder | null>(null);
   const rawRecorderRef = useRef<MediaRecorder | null>(null);
+  const koalaRef = useRef<KoalaWorker | null>(null);
+
   const speexChunksRef = useRef<Blob[]>([]);
   const rnnoiseChunksRef = useRef<Blob[]>([]);
   const rawChunksRef = useRef<Blob[]>([]);
+  const koalaOutputFramesRef = useRef<Int16Array[]>([]);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const speexNodeRef = useRef<SpeexWorkletNode | null>(null);
   const rnnoiseNodeRef = useRef<RnnoiseWorkletNode | null>(null);
 
+  // Initialize Koala with the provided access key.
+  const initializeKoala = async () => {
+    if (koalaInitialized) return;
+    setLoading(true);
+    try {
+      const processCallback = (enhancedPcm: Int16Array) => {
+        koalaOutputFramesRef.current.push(enhancedPcm);
+      };
+
+      const processErrorCallback = (error: Error) => {
+        console.error(error);
+      };
+
+      koalaRef.current = await KoalaWorker.create(
+        accessKey,
+        processCallback,
+        { base64: koalaModel },
+        { processErrorCallback }
+      );
+
+      setKoalaInitialized(true);
+    } catch (error: any) {
+      console.error(error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const startRecording = async () => {
     try {
+      if (!koalaRef.current) throw new Error("Koala is not initialized!");
+
       // Get media stream
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -64,8 +106,8 @@ const App = () => {
       speexNodeRef.current.connect(speexProcessedStream);
 
       // Capture Speex processed audio
-      mediaRecorderRef.current = new MediaRecorder(speexProcessedStream.stream);
-      mediaRecorderRef.current.ondataavailable = (event) => {
+      speexRecorderRef.current = new MediaRecorder(speexProcessedStream.stream);
+      speexRecorderRef.current.ondataavailable = (event) => {
         speexChunksRef.current.push(event.data);
       };
 
@@ -92,7 +134,7 @@ const App = () => {
       };
 
       // Handle processed audio Blobs on recording stop
-      mediaRecorderRef.current.onstop = () => {
+      speexRecorderRef.current.onstop = () => {
         setSpeexAudioBlob(
           new Blob(speexChunksRef.current, { type: "audio/wav" })
         );
@@ -110,23 +152,30 @@ const App = () => {
         setRawAudioBlob(new Blob(rawChunksRef.current, { type: "audio/wav" }));
         rawChunksRef.current = [];
       };
+      //koala pre recording preparations
+      koalaOutputFramesRef.current = [];
+      WebVoiceProcessor.setOptions({
+        frameLength: koalaRef.current.frameLength,
+      });
 
       // Start recording
+      await WebVoiceProcessor.subscribe([koalaRef.current]);
+
       rawRecorderRef.current.start();
-      mediaRecorderRef.current.start();
+      speexRecorderRef.current.start();
       rnnoiseRecorderRef.current.start();
       setIsRecording(true);
     } catch (error) {
-      console.error("Error accessing microphone:", error);
+      console.error("Error:", error);
     }
   };
 
-  const stopRecording = () => {
+  const stopRecording = async () => {
     if (
-      mediaRecorderRef.current &&
-      mediaRecorderRef.current.state !== "inactive"
+      speexRecorderRef.current &&
+      speexRecorderRef.current.state !== "inactive"
     ) {
-      mediaRecorderRef.current.stop();
+      speexRecorderRef.current.stop();
     }
     if (
       rnnoiseRecorderRef.current &&
@@ -137,7 +186,20 @@ const App = () => {
     if (rawRecorderRef.current && rawRecorderRef.current.state !== "inactive") {
       rawRecorderRef.current.stop();
     }
+
+    if (koalaRef.current) {
+      await WebVoiceProcessor.unsubscribe([koalaRef.current]);
+    }
     setIsRecording(false);
+
+    //get processed Koala audio
+    const enhancedPcm = mergeFrames(
+      koalaOutputFramesRef.current,
+      koalaRef.current?.delaySample || 0
+    );
+
+    const { wavBuffer: koalaWavBuffer } = int16ToWavBuffer(enhancedPcm);
+    setKoalaAudioBlob(new Blob([koalaWavBuffer], { type: "audio/wav" }));
 
     // Cleanup
     if (audioContextRef.current) {
@@ -158,55 +220,110 @@ const App = () => {
     }
   };
 
+  // Merge an array of frames into one continuous Int16Array.
+  const mergeFrames = (frames: Int16Array[], delaySample = 0): Int16Array => {
+    if (!koalaRef.current) return new Int16Array();
+    const frameLength = koalaRef.current.frameLength;
+    const pcm = new Int16Array(frames.length * frameLength);
+    let delay = 0;
+
+    frames.forEach((frame, index) => {
+      if (index * frameLength < delaySample) {
+        delay += 1;
+      } else {
+        pcm.set(frame, (index - delay) * frameLength);
+      }
+    });
+
+    return pcm;
+  };
+
   return (
     <div className="container">
-      <button onClick={isRecording ? stopRecording : startRecording}>
-        {isRecording ? "Stop Recording" : "Start Recording"}
-      </button>
-
-      {rawAudioBlob && (
-        <div>
-          <h2>Raw Audio</h2>
-          <audio src={URL.createObjectURL(rawAudioBlob)} controls />
-          <AudioVisualizer
-            blob={rawAudioBlob}
-            width={500}
-            height={75}
-            barWidth={1}
-            gap={0}
-            barColor={"#f76565"}
-          />
+      {!koalaInitialized ? (
+        <div className="container">
+          <div>
+            <label>
+              PicoVoice Access Key: &nbsp;
+              <input
+                type="text"
+                onChange={(e) => setAccessKey(e.target.value)}
+                value={accessKey}
+              />
+            </label>
+          </div>
+          <button
+            disabled={loading || !accessKey}
+            onClick={() => initializeKoala()}
+          >
+            Initialize Koala
+          </button>
         </div>
-      )}
+      ) : (
+        <>
+          <button onClick={isRecording ? stopRecording : startRecording}>
+            {isRecording ? "Stop Recording" : "Start Recording"}
+          </button>
 
-      {speexAudioBlob && (
-        <div>
-          <h2>(Speex)Noise-Canceled Audio</h2>
-          <audio src={URL.createObjectURL(speexAudioBlob)} controls />
-          <AudioVisualizer
-            blob={speexAudioBlob}
-            width={500}
-            height={75}
-            barWidth={1}
-            gap={0}
-            barColor={"#f76565"}
-          />
-        </div>
-      )}
+          {rawAudioBlob && (
+            <div>
+              <h2>Raw Audio</h2>
+              <audio src={URL.createObjectURL(rawAudioBlob)} controls />
+              <AudioVisualizer
+                blob={rawAudioBlob}
+                width={500}
+                height={75}
+                barWidth={1}
+                gap={0}
+                barColor={"#f76565"}
+              />
+            </div>
+          )}
 
-      {rnnoiseAudioBlob && (
-        <div>
-          <h2>(Rnnoise) Noise-Canceled Audio</h2>
-          <audio src={URL.createObjectURL(rnnoiseAudioBlob)} controls />
-          <AudioVisualizer
-            blob={rnnoiseAudioBlob}
-            width={500}
-            height={75}
-            barWidth={1}
-            gap={0}
-            barColor={"#f76565"}
-          />
-        </div>
+          {speexAudioBlob && (
+            <div>
+              <h2>(Speex)Noise-Canceled Audio</h2>
+              <audio src={URL.createObjectURL(speexAudioBlob)} controls />
+              <AudioVisualizer
+                blob={speexAudioBlob}
+                width={500}
+                height={75}
+                barWidth={1}
+                gap={0}
+                barColor={"#f76565"}
+              />
+            </div>
+          )}
+
+          {rnnoiseAudioBlob && (
+            <div>
+              <h2>(Rnnoise) Noise-Canceled Audio</h2>
+              <audio src={URL.createObjectURL(rnnoiseAudioBlob)} controls />
+              <AudioVisualizer
+                blob={rnnoiseAudioBlob}
+                width={500}
+                height={75}
+                barWidth={1}
+                gap={0}
+                barColor={"#f76565"}
+              />
+            </div>
+          )}
+          {koalaAudioBlob && (
+            <div>
+              <h2>(PicoVoice Koala) Noise-Canceled Audio</h2>
+              <audio src={URL.createObjectURL(koalaAudioBlob)} controls />
+              <AudioVisualizer
+                blob={koalaAudioBlob}
+                width={500}
+                height={75}
+                barWidth={1}
+                gap={0}
+                barColor={"#f76565"}
+              />
+            </div>
+          )}
+        </>
       )}
     </div>
   );
