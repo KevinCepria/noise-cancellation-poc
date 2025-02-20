@@ -1,14 +1,5 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useMemo } from "react";
 import { AudioVisualizer, LiveAudioVisualizer } from "react-audio-visualize";
-import {
-  loadSpeex,
-  SpeexWorkletNode,
-  RnnoiseWorkletNode,
-} from "@sapphi-red/web-noise-suppressor";
-import speexWorkletPath from "@sapphi-red/web-noise-suppressor/speexWorklet.js?url";
-import speexWasmPath from "@sapphi-red/web-noise-suppressor/speex.wasm?url";
-import rnnoiseWorkletPath from "@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url";
-import rnnoiseWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise.wasm?url";
 import { KoalaWorker } from "@picovoice/koala-web";
 import { WebVoiceProcessor } from "@picovoice/web-voice-processor";
 
@@ -17,36 +8,62 @@ import { int16ToWavBuffer } from "./uitls/audio";
 
 const App = () => {
   const [isRecording, setIsRecording] = useState(false);
-  const [speexAudioBlob, setSpeexAudioBlob] = useState<Blob | null>(null);
-  const [rnnoiseAudioBlob, setRnnoiseAudioBlob] = useState<Blob | null>(null);
   const [rawAudioBlob, setRawAudioBlob] = useState<Blob | null>(null);
   const [koalaInitialized, setKoalaInitialized] = useState(false);
   const [koalaAudioBlob, setKoalaAudioBlob] = useState<Blob | null>(null);
   const [loading, setLoading] = useState(false);
   const [accessKey, setAccessKey] = useState("");
-  const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(
-    null
-  );
+  const [processedRecorder, setProcessedRecorder] =
+    useState<MediaRecorder | null>(null);
+  const [rawRecorder, setRawRecorder] = useState<MediaRecorder | null>(null);
 
   // This destination node will let us capture processed audio as a MediaStream.
-  const mediaDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(
+  const processedAudioDestinationRef =
+    useRef<MediaStreamAudioDestinationNode | null>(null);
+  const rawAudioDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(
     null
   );
 
-  const speexRecorderRef = useRef<MediaRecorder | null>(null);
-  const rnnoiseRecorderRef = useRef<MediaRecorder | null>(null);
-  const rawRecorderRef = useRef<MediaRecorder | null>(null);
   const koalaRef = useRef<KoalaWorker | null>(null);
-
-  const speexChunksRef = useRef<Blob[]>([]);
-  const rnnoiseChunksRef = useRef<Blob[]>([]);
-  const rawChunksRef = useRef<Blob[]>([]);
   const koalaOutputFramesRef = useRef<Int16Array[]>([]);
-
+  const koalaInputFramesRef = useRef<Int16Array[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const speexNodeRef = useRef<SpeexWorkletNode | null>(null);
-  const rnnoiseNodeRef = useRef<RnnoiseWorkletNode | null>(null);
+
+  const recorderEngine = useMemo(
+    () => ({
+      onmessage: (event: MessageEvent) => {
+        if (event.data.command === "process") {
+          // Process and store raw audio frames
+          koalaInputFramesRef.current.push(event.data.inputFrame as Int16Array);
+
+          // Route raw audio to the visualization destination
+          if (
+            audioContextRef.current &&
+            koalaRef.current &&
+            rawAudioDestinationRef.current
+          ) {
+            const frame = event.data.inputFrame;
+            const buffer = audioContextRef.current.createBuffer(
+              1,
+              frame.length,
+              koalaRef.current.sampleRate
+            );
+            const floatData = new Float32Array(frame.length);
+            for (let i = 0; i < frame.length; i++) {
+              floatData[i] = frame[i] < 0 ? frame[i] / 32768 : frame[i] / 32767;
+            }
+            buffer.copyToChannel(floatData, 0);
+
+            const source = audioContextRef.current.createBufferSource();
+            source.buffer = buffer;
+            source.connect(rawAudioDestinationRef.current);
+            source.start();
+          }
+        }
+      },
+    }),
+    []
+  );
 
   // Initialize Koala with the provided access key.
   const initializeKoala = async () => {
@@ -61,7 +78,7 @@ const App = () => {
         if (
           audioContextRef.current &&
           koalaRef.current &&
-          mediaDestinationRef.current
+          processedAudioDestinationRef.current
         ) {
           const buffer = audioContextRef.current.createBuffer(
             1,
@@ -80,7 +97,7 @@ const App = () => {
           const source = audioContextRef.current.createBufferSource();
           source.buffer = buffer;
           // Connect to the MediaStream destination (for visualization)
-          source.connect(mediaDestinationRef.current);
+          source.connect(processedAudioDestinationRef.current);
           source.start();
         }
       };
@@ -108,107 +125,36 @@ const App = () => {
     try {
       if (!koalaRef.current) throw new Error("Koala is not initialized!");
 
-      // Get media stream
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-        },
-      });
-
-      // Capture raw audio
-      rawRecorderRef.current = new MediaRecorder(stream);
-      rawRecorderRef.current.ondataavailable = (event) => {
-        rawChunksRef.current.push(event.data);
-      };
-
       // Setup AudioContext
       audioContextRef.current = new AudioContext({ sampleRate: 16000 });
-      sourceNodeRef.current =
-        audioContextRef.current.createMediaStreamSource(stream);
 
-      // Load Speex WASM binary and processor
-      const speexWasmBinary = await loadSpeex({ url: speexWasmPath });
-      await audioContextRef.current.audioWorklet.addModule(speexWorkletPath);
-      speexNodeRef.current = new SpeexWorkletNode(audioContextRef.current, {
-        wasmBinary: speexWasmBinary,
-        maxChannels: 1,
-      });
-      sourceNodeRef.current.connect(speexNodeRef.current);
-
-      // Create stream for Speex processed audio
-      const speexProcessedStream =
-        audioContextRef.current.createMediaStreamDestination();
-      speexNodeRef.current.connect(speexProcessedStream);
-
-      // Capture Speex processed audio
-      speexRecorderRef.current = new MediaRecorder(speexProcessedStream.stream);
-      speexRecorderRef.current.ondataavailable = (event) => {
-        speexChunksRef.current.push(event.data);
-      };
-
-      // Load RNNoise WASM binary and processor
-      const rnnoiseWasmBinary = await loadSpeex({ url: rnnoiseWasmPath });
-      await audioContextRef.current.audioWorklet.addModule(rnnoiseWorkletPath);
-      rnnoiseNodeRef.current = new RnnoiseWorkletNode(audioContextRef.current, {
-        wasmBinary: rnnoiseWasmBinary,
-        maxChannels: 1,
-      });
-      sourceNodeRef.current.connect(rnnoiseNodeRef.current);
-
-      // Create stream for RNNoise processed audio
-      const rnnoiseProcessedStream =
-        audioContextRef.current.createMediaStreamDestination();
-      rnnoiseNodeRef.current.connect(rnnoiseProcessedStream);
-
-      // Capture RNNoise processed audio
-      rnnoiseRecorderRef.current = new MediaRecorder(
-        rnnoiseProcessedStream.stream
-      );
-      rnnoiseRecorderRef.current.ondataavailable = (event) => {
-        rnnoiseChunksRef.current.push(event.data);
-      };
-
-      // Handle processed audio Blobs on recording stop
-      speexRecorderRef.current.onstop = () => {
-        setSpeexAudioBlob(
-          new Blob(speexChunksRef.current, { type: "audio/wav" })
-        );
-        speexChunksRef.current = [];
-      };
-
-      rnnoiseRecorderRef.current.onstop = () => {
-        setRnnoiseAudioBlob(
-          new Blob(rnnoiseChunksRef.current, { type: "audio/wav" })
-        );
-        rnnoiseChunksRef.current = [];
-      };
-
-      rawRecorderRef.current.onstop = () => {
-        setRawAudioBlob(new Blob(rawChunksRef.current, { type: "audio/wav" }));
-        rawChunksRef.current = [];
-      };
-      //koala pre recording preparations
       koalaOutputFramesRef.current = [];
+      koalaInputFramesRef.current = [];
+
       WebVoiceProcessor.setOptions({
         frameLength: koalaRef.current.frameLength,
       });
-
       // Start recording
-      await WebVoiceProcessor.subscribe([koalaRef.current]);
-
-      rawRecorderRef.current.start();
-      speexRecorderRef.current.start();
-      rnnoiseRecorderRef.current.start();
+      await WebVoiceProcessor.subscribe([recorderEngine, koalaRef.current]);
 
       // Create a MediaStream destination node to capture processed audio.
-      mediaDestinationRef.current =
+      processedAudioDestinationRef.current =
+        audioContextRef.current.createMediaStreamDestination();
+      rawAudioDestinationRef.current =
         audioContextRef.current.createMediaStreamDestination();
 
       // Create a MediaRecorder from the destination's stream for visualization.
-      const recorder = new MediaRecorder(mediaDestinationRef.current.stream);
-      recorder.start(); // Start capturing audio data.
-      setMediaRecorder(recorder);
+      const processedRecorder = new MediaRecorder(
+        processedAudioDestinationRef.current.stream
+      );
+      const rawRecorder = new MediaRecorder(
+        rawAudioDestinationRef.current.stream
+      );
+
+      processedRecorder.start(); // Start capturing audio data.
+      rawRecorder.start();
+      setProcessedRecorder(processedRecorder);
+      setRawRecorder(rawRecorder);
 
       setIsRecording(true);
     } catch (error) {
@@ -217,57 +163,44 @@ const App = () => {
   };
 
   const stopRecording = async () => {
-    if (
-      speexRecorderRef.current &&
-      speexRecorderRef.current.state !== "inactive"
-    ) {
-      speexRecorderRef.current.stop();
-    }
-    if (
-      rnnoiseRecorderRef.current &&
-      rnnoiseRecorderRef.current.state !== "inactive"
-    ) {
-      rnnoiseRecorderRef.current.stop();
-    }
-    if (rawRecorderRef.current && rawRecorderRef.current.state !== "inactive") {
-      rawRecorderRef.current.stop();
-    }
-
     if (koalaRef.current) {
-      await WebVoiceProcessor.unsubscribe([koalaRef.current]);
+      await WebVoiceProcessor.unsubscribe([recorderEngine, koalaRef.current]);
     }
     setIsRecording(false);
 
+    // Stop the MediaRecorders before closing the AudioContext.
+    if (processedRecorder) {
+      processedRecorder.stop();
+      processedRecorder.stream.getTracks().forEach((track) => track.stop());
+      setProcessedRecorder(null);
+    }
+    if (rawRecorder) {
+      rawRecorder.stop();
+      rawRecorder.stream.getTracks().forEach((track) => track.stop());
+      setRawRecorder(null);
+    }
+
+    // Disconnect Source nodes
+    rawAudioDestinationRef.current?.disconnect();
+    processedAudioDestinationRef.current?.disconnect();
+
     //get processed Koala audio
+    const rawPcm = mergeFrames(koalaInputFramesRef.current);
     const enhancedPcm = mergeFrames(
       koalaOutputFramesRef.current,
       koalaRef.current?.delaySample || 0
     );
 
+    const { wavBuffer: rawWavBuffer } = int16ToWavBuffer(rawPcm);
     const { wavBuffer: koalaWavBuffer } = int16ToWavBuffer(enhancedPcm);
+
     setKoalaAudioBlob(new Blob([koalaWavBuffer], { type: "audio/wav" }));
+    setRawAudioBlob(new Blob([rawWavBuffer], { type: "audio/wav" }));
 
     // Cleanup
     if (audioContextRef.current) {
       audioContextRef.current.close();
       audioContextRef.current = null;
-    }
-    if (speexNodeRef.current) {
-      speexNodeRef.current.disconnect();
-      speexNodeRef.current = null;
-    }
-    if (rnnoiseNodeRef.current) {
-      rnnoiseNodeRef.current.disconnect();
-      rnnoiseNodeRef.current = null;
-    }
-    if (sourceNodeRef.current) {
-      sourceNodeRef.current.disconnect();
-      sourceNodeRef.current = null;
-    }
-    if (mediaRecorder) {
-      mediaRecorder.stop();
-      mediaRecorder.stream.getTracks().forEach((track) => track.stop());
-      setMediaRecorder(null);
     }
   };
 
@@ -316,12 +249,12 @@ const App = () => {
             {isRecording ? "Stop Recording" : "Start Recording"}
           </button>
 
-          {isRecording && mediaRecorder && rawRecorderRef.current && (
+          {isRecording && processedRecorder && rawRecorder && (
             <>
               <div>
                 <h2>Raw Audio</h2>
                 <LiveAudioVisualizer
-                  mediaRecorder={rawRecorderRef.current}
+                  mediaRecorder={rawRecorder}
                   width={500}
                   height={150}
                 />
@@ -329,7 +262,7 @@ const App = () => {
               <div>
                 <h2>(PicoVoice Koala) Noise-Canceled Audio</h2>
                 <LiveAudioVisualizer
-                  mediaRecorder={mediaRecorder}
+                  mediaRecorder={processedRecorder}
                   width={500}
                   height={150}
                 />
@@ -353,35 +286,6 @@ const App = () => {
                 </div>
               )}
 
-              {speexAudioBlob && (
-                <div>
-                  <h2>(Speex)Noise-Canceled Audio</h2>
-                  <audio src={URL.createObjectURL(speexAudioBlob)} controls />
-                  <AudioVisualizer
-                    blob={speexAudioBlob}
-                    width={500}
-                    height={75}
-                    barWidth={1}
-                    gap={0}
-                    barColor={"#f76565"}
-                  />
-                </div>
-              )}
-
-              {rnnoiseAudioBlob && (
-                <div>
-                  <h2>(Rnnoise) Noise-Canceled Audio</h2>
-                  <audio src={URL.createObjectURL(rnnoiseAudioBlob)} controls />
-                  <AudioVisualizer
-                    blob={rnnoiseAudioBlob}
-                    width={500}
-                    height={75}
-                    barWidth={1}
-                    gap={0}
-                    barColor={"#f76565"}
-                  />
-                </div>
-              )}
               {koalaAudioBlob && (
                 <div>
                   <h2>(PicoVoice Koala) Noise-Canceled Audio</h2>
