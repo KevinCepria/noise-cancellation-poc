@@ -1,5 +1,5 @@
 import { useState, useRef } from "react";
-import { AudioVisualizer } from "react-audio-visualize";
+import { AudioVisualizer, LiveAudioVisualizer } from "react-audio-visualize";
 import {
   loadSpeex,
   SpeexWorkletNode,
@@ -24,6 +24,14 @@ const App = () => {
   const [koalaAudioBlob, setKoalaAudioBlob] = useState<Blob | null>(null);
   const [loading, setLoading] = useState(false);
   const [accessKey, setAccessKey] = useState("");
+  const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(
+    null
+  );
+
+  // This destination node will let us capture processed audio as a MediaStream.
+  const mediaDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(
+    null
+  );
 
   const speexRecorderRef = useRef<MediaRecorder | null>(null);
   const rnnoiseRecorderRef = useRef<MediaRecorder | null>(null);
@@ -47,6 +55,34 @@ const App = () => {
     try {
       const processCallback = (enhancedPcm: Int16Array) => {
         koalaOutputFramesRef.current.push(enhancedPcm);
+
+        // Play the processed frame by routing it to both the speakers
+        // and the media destination (for visualization)
+        if (
+          audioContextRef.current &&
+          koalaRef.current &&
+          mediaDestinationRef.current
+        ) {
+          const buffer = audioContextRef.current.createBuffer(
+            1,
+            enhancedPcm.length,
+            koalaRef.current.sampleRate
+          );
+          const floatData = new Float32Array(enhancedPcm.length);
+          for (let i = 0; i < enhancedPcm.length; i++) {
+            floatData[i] =
+              enhancedPcm[i] < 0
+                ? enhancedPcm[i] / 32768
+                : enhancedPcm[i] / 32767;
+          }
+          buffer.copyToChannel(floatData, 0);
+
+          const source = audioContextRef.current.createBufferSource();
+          source.buffer = buffer;
+          // Connect to the MediaStream destination (for visualization)
+          source.connect(mediaDestinationRef.current);
+          source.start();
+        }
       };
 
       const processErrorCallback = (error: Error) => {
@@ -87,7 +123,7 @@ const App = () => {
       };
 
       // Setup AudioContext
-      audioContextRef.current = new AudioContext();
+      audioContextRef.current = new AudioContext({ sampleRate: 16000 });
       sourceNodeRef.current =
         audioContextRef.current.createMediaStreamSource(stream);
 
@@ -164,6 +200,16 @@ const App = () => {
       rawRecorderRef.current.start();
       speexRecorderRef.current.start();
       rnnoiseRecorderRef.current.start();
+
+      // Create a MediaStream destination node to capture processed audio.
+      mediaDestinationRef.current =
+        audioContextRef.current.createMediaStreamDestination();
+
+      // Create a MediaRecorder from the destination's stream for visualization.
+      const recorder = new MediaRecorder(mediaDestinationRef.current.stream);
+      recorder.start(); // Start capturing audio data.
+      setMediaRecorder(recorder);
+
       setIsRecording(true);
     } catch (error) {
       console.error("Error:", error);
@@ -218,6 +264,11 @@ const App = () => {
       sourceNodeRef.current.disconnect();
       sourceNodeRef.current = null;
     }
+    if (mediaRecorder) {
+      mediaRecorder.stop();
+      mediaRecorder.stream.getTracks().forEach((track) => track.stop());
+      setMediaRecorder(null);
+    }
   };
 
   // Merge an array of frames into one continuous Int16Array.
@@ -265,63 +316,87 @@ const App = () => {
             {isRecording ? "Stop Recording" : "Start Recording"}
           </button>
 
-          {rawAudioBlob && (
-            <div>
-              <h2>Raw Audio</h2>
-              <audio src={URL.createObjectURL(rawAudioBlob)} controls />
-              <AudioVisualizer
-                blob={rawAudioBlob}
-                width={500}
-                height={75}
-                barWidth={1}
-                gap={0}
-                barColor={"#f76565"}
-              />
-            </div>
+          {isRecording && mediaRecorder && rawRecorderRef.current && (
+            <>
+              <div>
+                <h2>Raw Audio</h2>
+                <LiveAudioVisualizer
+                  mediaRecorder={rawRecorderRef.current}
+                  width={500}
+                  height={150}
+                />
+              </div>
+              <div>
+                <h2>(PicoVoice Koala) Noise-Canceled Audio</h2>
+                <LiveAudioVisualizer
+                  mediaRecorder={mediaRecorder}
+                  width={500}
+                  height={150}
+                />
+              </div>
+            </>
           )}
+          {!isRecording && (
+            <>
+              {rawAudioBlob && (
+                <div>
+                  <h2>Raw Audio</h2>
+                  <audio src={URL.createObjectURL(rawAudioBlob)} controls />
+                  <AudioVisualizer
+                    blob={rawAudioBlob}
+                    width={500}
+                    height={75}
+                    barWidth={1}
+                    gap={0}
+                    barColor={"#f76565"}
+                  />
+                </div>
+              )}
 
-          {speexAudioBlob && (
-            <div>
-              <h2>(Speex)Noise-Canceled Audio</h2>
-              <audio src={URL.createObjectURL(speexAudioBlob)} controls />
-              <AudioVisualizer
-                blob={speexAudioBlob}
-                width={500}
-                height={75}
-                barWidth={1}
-                gap={0}
-                barColor={"#f76565"}
-              />
-            </div>
-          )}
+              {speexAudioBlob && (
+                <div>
+                  <h2>(Speex)Noise-Canceled Audio</h2>
+                  <audio src={URL.createObjectURL(speexAudioBlob)} controls />
+                  <AudioVisualizer
+                    blob={speexAudioBlob}
+                    width={500}
+                    height={75}
+                    barWidth={1}
+                    gap={0}
+                    barColor={"#f76565"}
+                  />
+                </div>
+              )}
 
-          {rnnoiseAudioBlob && (
-            <div>
-              <h2>(Rnnoise) Noise-Canceled Audio</h2>
-              <audio src={URL.createObjectURL(rnnoiseAudioBlob)} controls />
-              <AudioVisualizer
-                blob={rnnoiseAudioBlob}
-                width={500}
-                height={75}
-                barWidth={1}
-                gap={0}
-                barColor={"#f76565"}
-              />
-            </div>
-          )}
-          {koalaAudioBlob && (
-            <div>
-              <h2>(PicoVoice Koala) Noise-Canceled Audio</h2>
-              <audio src={URL.createObjectURL(koalaAudioBlob)} controls />
-              <AudioVisualizer
-                blob={koalaAudioBlob}
-                width={500}
-                height={75}
-                barWidth={1}
-                gap={0}
-                barColor={"#f76565"}
-              />
-            </div>
+              {rnnoiseAudioBlob && (
+                <div>
+                  <h2>(Rnnoise) Noise-Canceled Audio</h2>
+                  <audio src={URL.createObjectURL(rnnoiseAudioBlob)} controls />
+                  <AudioVisualizer
+                    blob={rnnoiseAudioBlob}
+                    width={500}
+                    height={75}
+                    barWidth={1}
+                    gap={0}
+                    barColor={"#f76565"}
+                  />
+                </div>
+              )}
+              {koalaAudioBlob && (
+                <div>
+                  <h2>(PicoVoice Koala) Noise-Canceled Audio</h2>
+                  <audio src={URL.createObjectURL(koalaAudioBlob)} controls />
+                  <AudioVisualizer
+                    blob={koalaAudioBlob}
+                    width={500}
+                    height={75}
+                    barWidth={1}
+                    gap={0}
+                    barColor={"#f76565"}
+                  />
+                </div>
+              )}
+            </>
           )}
         </>
       )}
