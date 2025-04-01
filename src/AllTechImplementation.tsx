@@ -2,6 +2,7 @@ import { useState, useRef } from "react";
 import { AudioVisualizer, LiveAudioVisualizer } from "react-audio-visualize";
 import {
   loadSpeex,
+  loadRnnoise,
   SpeexWorkletNode,
   RnnoiseWorkletNode,
 } from "@sapphi-red/web-noise-suppressor";
@@ -9,6 +10,8 @@ import speexWorkletPath from "@sapphi-red/web-noise-suppressor/speexWorklet.js?u
 import speexWasmPath from "@sapphi-red/web-noise-suppressor/speex.wasm?url";
 import rnnoiseWorkletPath from "@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url";
 import rnnoiseWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise.wasm?url";
+import rnnoiseSimdWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm?url";
+
 import { KoalaWorker } from "@picovoice/koala-web";
 import { WebVoiceProcessor } from "@picovoice/web-voice-processor";
 
@@ -148,12 +151,16 @@ const App = () => {
       };
 
       // Load RNNoise WASM binary and processor
-      const rnnoiseWasmBinary = await loadSpeex({ url: rnnoiseWasmPath });
+      const rnnoiseWasmBinary = await loadRnnoise({
+        url: rnnoiseWasmPath,
+        simdUrl: rnnoiseSimdWasmPath,
+      });
       await audioContextRef.current.audioWorklet.addModule(rnnoiseWorkletPath);
       rnnoiseNodeRef.current = new RnnoiseWorkletNode(audioContextRef.current, {
         wasmBinary: rnnoiseWasmBinary,
         maxChannels: 1,
       });
+      
       sourceNodeRef.current.connect(rnnoiseNodeRef.current);
 
       // Create stream for RNNoise processed audio
